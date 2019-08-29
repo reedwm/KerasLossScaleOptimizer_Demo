@@ -127,7 +127,6 @@ print(autoencoder.summary())
 
 from callback import ProgbarLogger
 
-# from keras_tqdm import TQDMCallback
 progbar_callback = ProgbarLogger(count_mode='samples', stateful_metrics=['mae'])
 
 print("Evaluation Before training - At Initialization")

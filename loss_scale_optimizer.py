@@ -17,7 +17,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import six
 import sys
 
 from tensorflow.python.distribute import distribution_strategy_context
@@ -155,9 +154,6 @@ class LossScaleOptimizerMeta(type):
         )
 
 
-# @keras_export('keras.mixed_precision.experimental.LossScaleOptimizer')
-# @six.with_metaclass()
-# @keras_export('keras.mixed_precision.experimental.LossScaleOptimizer')
 @keras_export('keras.optimizers.LossScaleOptimizer')
 class LossScaleOptimizer(metaclass=LossScaleOptimizerMeta):
 
