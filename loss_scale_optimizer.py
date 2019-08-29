@@ -17,14 +17,17 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import six
 import sys
 
 from tensorflow.python.distribute import distribution_strategy_context
 from tensorflow.python.framework import smart_cond
 from tensorflow.python.keras import backend
 from tensorflow.python.keras.optimizer_v2 import optimizer_v2
+from tensorflow.python.keras.utils.generic_utils import _GLOBAL_CUSTOM_OBJECTS
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.training.experimental import loss_scale as loss_scale_module
+from tensorflow.python.util.tf_export import keras_export
 
 
 class _UnwrapPreventer(object):
@@ -43,7 +46,120 @@ class _UnwrapPreventer(object):
         self.value = value
 
 
-class _LossScaleOptimizer(object):
+class LossScaleOptimizerMeta(type):
+
+    @staticmethod
+    def __call__(opt, loss_scale, name="LossScale_"):
+        """Initializes a loss scaled optimizer.
+
+        Args:
+          opt: The Optimizer instance to wrap.
+          loss_scale: The loss scale to scale the loss and gradients. This can
+            either be an int/float to use a fixed loss scale, the string "dynamic"
+            to use dynamic loss scaling, or an instance of a LossScale. The string
+            "dynamic" equivalent to passing `DynamicLossScale()`, and passing an
+            int/float is equivalent to passing a FixedLossScale with the given loss
+            scale.
+          name: Optional name for the operations created when applying gradients.
+            Defaults to "loss_scale_optimizer".
+        Returns:
+          Keras Optimizer with loss scaling
+
+        Loss scaling is a process that multiplies the loss by a multiplier called the
+        loss scale, and divides each gradient by the same multiplier. The pseudocode
+        for this process is:
+
+        ```
+        loss = ...
+        loss *= loss_scale
+        grads = gradients(loss, vars)
+        grads /= loss_scale
+        ```
+
+        Mathematically, loss scaling has no effect, but can help avoid numerical
+        underflow in intermediate gradients when float16 tensors are used. By
+        multiplying the loss, each intermediate gradient will have the same multiplier
+        applied.
+
+        The loss scale can either be a fixed constant, chosen by the user, or be
+        dynamically determined. Dynamically determining the loss scale is convenient
+        as a loss scale does not have to be explicitly chosen. However it reduces
+        performance.
+
+        This optimizer wraps another optimizer and applies loss scaling to it via a
+        `LossScale`. Loss scaling is applied whenever gradients are
+        computed, either through `minimize()` or `get_gradients()`. The loss scale is
+        updated via `LossScale.update()` whenever gradients are applied, either
+        through `minimize()` or `apply_gradients()`. For example:
+
+        ```python
+        opt = tf.keras.optimizers.SGD(0.1)
+        opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, "dynamic")
+        # 'minimize' applies loss scaling to the loss and updates the loss sale.
+        opt.minimize(loss_fn)
+        ```
+
+        If a `tf.GradientTape` is used to compute gradients instead of
+        `LossScaleOptimizer.minimize` or `LossScaleOptimizer.get_gradients`, the loss
+        and gradients must be scaled manually. This can be done by calling
+        `LossScaleOptimizer.get_scaled_loss` before passing the loss to
+        `tf.GradientTape`, and `LossScaleOptimizer.get_unscaled_gradients` after
+        computing the gradients with `tf.GradientTape`. For example:
+
+        ```python
+        opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(...)
+        vars = ...
+        with tf.GradientTape() as tape:
+          loss = ...
+          scaled_loss = opt.get_scaled_loss(loss)
+        scaled_grads = tape.gradient(scaled_loss, vars)
+        grads = opt.get_unscaled_gradients(scaled_grads)
+        opt.apply_gradients(zip(grads, vars))  # Loss scale will be updated here
+        ```
+        """
+
+        if not isinstance(opt, optimizer_v2.OptimizerV2):
+            raise ValueError('"opt" must be an instance of OptimizerV2, but got: %s'
+                             % opt)
+
+        if hasattr(opt, 'clipnorm'):
+            raise ValueError('LossScaleOptimizer does not support wrapping '
+                             'optimizers with a clipnorm. Optimizer %s has clipnorm '
+                             '%s' % (opt, opt.clipnorm))
+
+        if hasattr(opt, 'clipvalue'):
+            raise ValueError('LossScaleOptimizer does not support wrapping '
+                             'optimizers with a clipvalue. Optimizer %s has '
+                             'clipvalue %s' % (opt, opt.clipvalue))
+
+        # We dynamically create a new class that inherits from the optimizer that was passed in.
+        # The goal is to override get_gradients() method with the loss scaling mechanism.
+
+        opt_cls = type(
+            LossScaleOptimizer.__name__,
+            (opt.__class__,),
+            dict(LossScaleOptimizer.__dict__)
+        )
+
+        additional_config = opt.get_config()
+
+        try:
+            additional_config["name"] = "%s%s" % (name, additional_config["name"])
+        except KeyError:
+            additional_config["name"] = name
+
+        return opt_cls(
+            loss_scale=loss_scale,
+            opt_class=opt.__class__,
+            **additional_config
+        )
+
+
+# @keras_export('keras.mixed_precision.experimental.LossScaleOptimizer')
+# @six.with_metaclass()
+# @keras_export('keras.mixed_precision.experimental.LossScaleOptimizer')
+@keras_export('keras.optimizers.LossScaleOptimizer')
+class LossScaleOptimizer(metaclass=LossScaleOptimizerMeta):
 
     def __init__(self, loss_scale, opt_class, **kwargs):
 
@@ -233,115 +349,6 @@ class _LossScaleOptimizer(object):
         
         return config
 
-
-class LossScaleOptimizerProxy(object):
-
-    @classmethod
-    def __call__(cls, opt, loss_scale, name="LossScale_"):
-        """Initializes a loss scaled optimizer.
-
-        Args:
-          opt: The Optimizer instance to wrap.
-          loss_scale: The loss scale to scale the loss and gradients. This can
-            either be an int/float to use a fixed loss scale, the string "dynamic"
-            to use dynamic loss scaling, or an instance of a LossScale. The string
-            "dynamic" equivalent to passing `DynamicLossScale()`, and passing an
-            int/float is equivalent to passing a FixedLossScale with the given loss
-            scale.
-          name: Optional name for the operations created when applying gradients.
-            Defaults to "loss_scale_optimizer".
-        Returns:
-          Keras Optimizer with loss scaling
-
-        Loss scaling is a process that multiplies the loss by a multiplier called the
-        loss scale, and divides each gradient by the same multiplier. The pseudocode
-        for this process is:
-
-        ```
-        loss = ...
-        loss *= loss_scale
-        grads = gradients(loss, vars)
-        grads /= loss_scale
-        ```
-
-        Mathematically, loss scaling has no effect, but can help avoid numerical
-        underflow in intermediate gradients when float16 tensors are used. By
-        multiplying the loss, each intermediate gradient will have the same multiplier
-        applied.
-
-        The loss scale can either be a fixed constant, chosen by the user, or be
-        dynamically determined. Dynamically determining the loss scale is convenient
-        as a loss scale does not have to be explicitly chosen. However it reduces
-        performance.
-
-        This optimizer wraps another optimizer and applies loss scaling to it via a
-        `LossScale`. Loss scaling is applied whenever gradients are
-        computed, either through `minimize()` or `get_gradients()`. The loss scale is
-        updated via `LossScale.update()` whenever gradients are applied, either
-        through `minimize()` or `apply_gradients()`. For example:
-
-        ```python
-        opt = tf.keras.optimizers.SGD(0.1)
-        opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, "dynamic")
-        # 'minimize' applies loss scaling to the loss and updates the loss sale.
-        opt.minimize(loss_fn)
-        ```
-
-        If a `tf.GradientTape` is used to compute gradients instead of
-        `LossScaleOptimizer.minimize` or `LossScaleOptimizer.get_gradients`, the loss
-        and gradients must be scaled manually. This can be done by calling
-        `LossScaleOptimizer.get_scaled_loss` before passing the loss to
-        `tf.GradientTape`, and `LossScaleOptimizer.get_unscaled_gradients` after
-        computing the gradients with `tf.GradientTape`. For example:
-
-        ```python
-        opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(...)
-        vars = ...
-        with tf.GradientTape() as tape:
-          loss = ...
-          scaled_loss = opt.get_scaled_loss(loss)
-        scaled_grads = tape.gradient(scaled_loss, vars)
-        grads = opt.get_unscaled_gradients(scaled_grads)
-        opt.apply_gradients(zip(grads, vars))  # Loss scale will be updated here
-        ```
-        """
-
-        if not isinstance(opt, optimizer_v2.OptimizerV2):
-            raise ValueError('"opt" must be an instance of OptimizerV2, but got: %s'
-                             % opt)
-
-        if hasattr(opt, 'clipnorm'):
-            raise ValueError('LossScaleOptimizer does not support wrapping '
-                             'optimizers with a clipnorm. Optimizer %s has clipnorm '
-                             '%s' % (opt, opt.clipnorm))
-
-        if hasattr(opt, 'clipvalue'):
-            raise ValueError('LossScaleOptimizer does not support wrapping '
-                             'optimizers with a clipvalue. Optimizer %s has '
-                             'clipvalue %s' % (opt, opt.clipvalue))
-
-        # We dynamically create a new class that inherits from the optimizer that was passed in.
-        # The goal is to override get_gradients() method with the loss scaling mechanism.
-
-        opt_cls = type(
-            "LossScaleOptimizer",
-            (opt.__class__,),
-            dict(_LossScaleOptimizer.__dict__)
-        )
-
-        additional_config = opt.get_config()
-
-        try:
-            additional_config["name"] = "%s%s" % (name, additional_config["name"])
-        except KeyError:
-            additional_config["name"] = name
-
-        return opt_cls(
-            loss_scale=loss_scale,
-            opt_class=opt.__class__,
-            **additional_config
-        )
-
     @classmethod
     def from_config(cls, config, custom_objects=None):
 
@@ -364,4 +371,4 @@ class LossScaleOptimizerProxy(object):
         return cls.__call__(opt, loss_scale=loss_scale, name="LossScale_")
 
 
-LossScaleOptimizer = LossScaleOptimizerProxy()
+_GLOBAL_CUSTOM_OBJECTS["LossScaleOptimizer"] = LossScaleOptimizer

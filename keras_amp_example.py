@@ -158,14 +158,11 @@ for epoch in range(4):
     optimizer.learning_rate = optimizer.learning_rate / 2
 
     # Testing Model Saving
-    print("\nSaving Model ...")
+    print("\n\nSaving Model ...")
     autoencoder.save('my_model.h5')
 
     # Testing Model Saving
     print("Restoring Model ...")
-    autoencoder = keras.models.load_model(
-        'my_model.h5',
-        custom_objects={'LossScaleOptimizer': keras.mixed_precision.experimental.LossScaleOptimizer}
-    )
+    autoencoder = keras.models.load_model('my_model.h5')
 
     print("\n%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
