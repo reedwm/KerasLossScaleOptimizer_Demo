@@ -8,7 +8,7 @@ Steps to run the example
 git clone  https://github.com/DEKHTIARJonathan/KerasLossScaleOptimizer_Demo.git && cd KerasLossScaleOptimizer_Demo
 ```  
 
-## 2. download data and put the files in your directory
+## 2 -- download data and put the files in your directory
 
 Download Link: https://drive.google.com/drive/folders/1ryQGhurGivPV-N-16m_jPIpnedfm4QR0?usp=sharing
 
