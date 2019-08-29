@@ -135,9 +135,6 @@ class ProgbarLogger(Callback):
         else:
             target = self.params['steps'] * self.params["batch_size"]
 
-        print("TARGET:", target)
-        print("PARAMS:", self.params)
-
         self.target = target
         self.progbar = Progbar(target=self.target,
                                verbose=1,
