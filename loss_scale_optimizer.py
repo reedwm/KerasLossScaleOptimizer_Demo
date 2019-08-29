@@ -43,7 +43,7 @@ class _UnwrapPreventer(object):
         self.value = value
 
 
-class _LossScaleOptimizer(optimizer_v2.OptimizerV2):
+class _LossScaleOptimizer(object):
 
     def __init__(self, loss_scale, opt_class, **kwargs):
 
@@ -207,14 +207,6 @@ class _LossScaleOptimizer(optimizer_v2.OptimizerV2):
 
         return super(self.__class__, self).apply_gradients(list(zip(grads, wrapped_vars.value)), name)
 
-    @property
-    def iterations(self):
-        return super(self.__class__, self).iterations
-
-    @iterations.setter
-    def iterations(self, variable):
-        super(self.__class__, self).iterations = variable
-
     # For the most part, we only expose methods in the base OptimizerV2, not
     # individual subclasses like Adam. However, although "learning_rate" and "lr"
     # properties are not part of the base OptimizerV2 class, they are part of most
@@ -238,6 +230,7 @@ class _LossScaleOptimizer(optimizer_v2.OptimizerV2):
             'opt_class': ".".join([self._opt_class.__module__, self._opt_class.__name__]),
             'opt': super(self.__class__, self).get_config(),
         }
+        
         return config
 
 
