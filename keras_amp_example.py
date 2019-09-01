@@ -105,11 +105,18 @@ decoded = Conv1D(
     kernel_regularizer=regularizers.l1(reg_strength)
 )(decoded)
 
+# loss_scaler = tf.train.experimental.FixedLossScale(32768)
+# loss_scaler = tf.train.experimental.DynamicLossScale(
+#     initial_loss_scale=(2 ** 15),
+#     increment_period=2000,
+#     multiplier=2.0
+# )
+loss_scaler = "dynamic"
+
 optimizer = tf.keras.optimizers.Adam(lr=LEARNING_RATE)
-optimizer = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt=optimizer, loss_scale="dynamic")
+optimizer = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt=optimizer, loss_scale=loss_scaler)
 
 print('Optimizer Configuration:')
-# pprint.pprint(optimizer.get_config(), indent=4)
 
 print('\nOptimizer `get_slot_names()`:', optimizer.get_slot_names())
 print()
@@ -123,13 +130,13 @@ autoencoder = Model.from_config(model_config)
 autoencoder.compile(optimizer=optimizer, loss='mae', metrics=['mae'], run_eagerly=False)
 
 # ============ Test Model Summary ============ #
-print(autoencoder.summary())
+autoencoder.summary()
 
 from callback import ProgbarLogger
 
 progbar_callback = ProgbarLogger(count_mode='samples', stateful_metrics=['mae'])
 
-print("Evaluation Before training - At Initialization")
+print("\nEvaluation Before training - At Initialization")
 autoencoder.evaluate(x=df_eval_conv, y=df_eval_conv, batch_size=BATCH_SIZE, verbose=0, callbacks=[progbar_callback])
 print("\n%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
 
@@ -138,10 +145,18 @@ for epoch in range(4):
 
     print("[*] Optimizer `learning_rate`: %f" % K.eval(optimizer.learning_rate))
     print("[*] Optimizer `lr`: %f" % K.eval(optimizer.lr))
-    print("[*] Optimizer `loss_scale_increment_period`: %f" % K.eval(optimizer.loss_scale_increment_period))
-    print("[*] Optimizer `loss_scale_multiplier`: %f" % K.eval(optimizer.loss_scale_multiplier))
-    print("[*] Optimizer `current_loss_scale`: %f" % K.eval(optimizer.current_loss_scale))
-    print("[*] Optimizer `num_good_steps`: %f" % K.eval(optimizer.num_good_steps))
+
+    print("\n[*] Optimizer `loss_scale_value`: %f" % K.eval(optimizer.loss_scale_value))
+
+    try:
+        print("[*] Optimizer `loss_scale_increment_period`: %f" % K.eval(optimizer.loss_scale_increment_period))
+        print("[*] Optimizer `loss_scale_multiplier`: %f" % K.eval(optimizer.loss_scale_multiplier))
+        print("[*] Optimizer `num_good_steps`: %f" % K.eval(optimizer.num_good_steps))
+    except ValueError:
+        if not isinstance(loss_scaler, tf.train.experimental.DynamicLossScale):
+            pass
+        else:
+            raise
 
     print('\n[*] Optimizer `variables()`', [var.name for var in optimizer.variables()])
     print('\n[*] Optimizer `get_weights()`', [weight.shape for weight in optimizer.get_weights()])

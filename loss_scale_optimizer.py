@@ -19,6 +19,8 @@ from __future__ import print_function
 
 import sys
 
+from six import add_metaclass
+
 from tensorflow.python.distribute import distribution_strategy_context
 from tensorflow.python.framework import smart_cond
 from tensorflow.python.keras import backend
@@ -47,8 +49,7 @@ class _UnwrapPreventer(object):
 
 class LossScaleOptimizerMeta(type):
 
-    @staticmethod
-    def __call__(opt, loss_scale, name="LossScale_"):
+    def __call__(cls, opt, loss_scale, name="LossScale_"):
         """Initializes a loss scaled optimizer.
 
         Args:
@@ -155,7 +156,11 @@ class LossScaleOptimizerMeta(type):
 
 
 @keras_export('keras.optimizers.LossScaleOptimizer')
-class LossScaleOptimizer(metaclass=LossScaleOptimizerMeta):
+@add_metaclass(LossScaleOptimizerMeta)
+class LossScaleOptimizer(object):
+
+    # TODO(reedwm): Maybe throw an error if mixed precision is used without this
+    # optimizer being used.
 
     def __init__(self, loss_scale, opt_class, **kwargs):
 
@@ -164,11 +169,6 @@ class LossScaleOptimizer(metaclass=LossScaleOptimizerMeta):
         self._opt_class = opt_class
 
         self._loss_scale = loss_scale_module.get(loss_scale)
-
-        self._set_hyper('loss_scale_increment_period', self._loss_scale._increment_period)
-        self._set_hyper('loss_scale_multiplier', self._loss_scale._multiplier)
-        self._set_hyper('current_loss_scale', self._loss_scale._current_loss_scale)
-        self._set_hyper('num_good_steps', self._loss_scale._num_good_steps)
 
         for weight in loss_scale_module.get_loss_scale_weights(self._loss_scale):
             # We cannot call `track_variable` in the LossScale class itself, because a
@@ -188,22 +188,40 @@ class LossScaleOptimizer(metaclass=LossScaleOptimizerMeta):
     @property
     def loss_scale_increment_period(self):
         """The `LossScale` instance associated with this optimizer."""
-        return self._loss_scale._increment_period
+        try:
+            return self._loss_scale._increment_period
+        except AttributeError:
+            raise ValueError("Loss Scale does not have an attribute `_increment_period`")
 
     @property
     def loss_scale_multiplier(self):
         """The `LossScale` instance associated with this optimizer."""
-        return self._loss_scale._multiplier
+        try:
+            return self._loss_scale._multiplier
+        except AttributeError:
+            raise ValueError("Loss Scale does not have an attribute `_multiplier`")
 
     @property
-    def current_loss_scale(self):
+    def loss_scale_value(self):
         """The `LossScale` instance associated with this optimizer."""
-        return self._loss_scale._current_loss_scale
+
+        loss_scale_values_attr_names = ["_current_loss_scale", "_loss_scale_value"]
+
+        for attr_name in loss_scale_values_attr_names:
+            if hasattr(self._loss_scale, attr_name):
+                return getattr(self._loss_scale, attr_name)
+        else:
+            raise ValueError(
+                "Loss Scale does not have any attribute with name: `%s`" % str(loss_scale_values_attr_names)
+            )
 
     @property
     def num_good_steps(self):
         """The `LossScale` instance associated with this optimizer."""
-        return self._loss_scale._num_good_steps
+        try:
+            return self._loss_scale._num_good_steps
+        except AttributeError:
+            raise ValueError("Loss Scale does not have an attribute `_num_good_steps`")
 
     def get_scaled_loss(self, loss):
         """Scales the loss by the loss scale.
@@ -319,28 +337,13 @@ class LossScaleOptimizer(metaclass=LossScaleOptimizerMeta):
 
         return super(self.__class__, self).apply_gradients(list(zip(grads, wrapped_vars.value)), name)
 
-    # For the most part, we only expose methods in the base OptimizerV2, not
-    # individual subclasses like Adam. However, although "learning_rate" and "lr"
-    # properties are not part of the base OptimizerV2 class, they are part of most
-    # subclasses, so we expose them here for convenience.
-
-    def get_slot_names(self):
-        """A list of names for this optimizer's slots."""
-        return super(self.__class__, self).get_slot_names()
-
-    # TODO(reedwm): Maybe merge this class's functionality into OptimizerV2.
-
-    # TODO(reedwm): Maybe throw an error if mixed precision is used without this
-    # optimizer being used.
-
     def get_config(self):
+
         config = {
-            'loss_scale_increment_period': self._serialize_hyperparameter('loss_scale_increment_period'),
-            'loss_scale_multiplier': self._serialize_hyperparameter('loss_scale_multiplier'),
-            'current_loss_scale': self._serialize_hyperparameter('current_loss_scale'),
-            'num_good_steps': self._serialize_hyperparameter('num_good_steps'),
-            'opt_class': ".".join([self._opt_class.__module__, self._opt_class.__name__]),
-            'opt': super(self.__class__, self).get_config(),
+            'loss_scale_classname': self._loss_scale.__class__.__name__,
+            'loss_scale_args': self._loss_scale.get_config(),
+            'opt_class': "%s.%s" % (self._opt_class.__module__, self._opt_class.__name__),
+            'opt': super(self.__class__, self).get_config()
         }
         
         return config
@@ -354,15 +357,14 @@ class LossScaleOptimizer(metaclass=LossScaleOptimizerMeta):
             sys.modules[".".join(base_opt_classname.split(".")[:-1])],
             base_opt_classname.split(".")[-1]
         )
-        opt = opt_class.from_config(config["opt"])
+        opt = opt_class.from_config(config["opt"], custom_objects=custom_objects)
 
-        loss_scale = loss_scale_module.DynamicLossScale(
-            initial_loss_scale=config["current_loss_scale"],
-            increment_period=config["loss_scale_increment_period"],
-            multiplier=config["loss_scale_multiplier"]
-        )
-
-        backend.set_value(loss_scale._num_good_steps, config["num_good_steps"])
+        for loss_scale_class in loss_scale_module.LossScale.__subclasses__():
+            if config["loss_scale_classname"] == loss_scale_class.__name__:
+                loss_scale = loss_scale_class.from_config(config["loss_scale_args"])
+                break
+        else:
+            raise ValueError("Unsupported Loss Scale class: %s" % config["loss_scale_classname"])
 
         return cls.__call__(opt, loss_scale=loss_scale, name="LossScale_")
 
