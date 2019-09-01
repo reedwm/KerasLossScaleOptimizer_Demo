@@ -105,21 +105,27 @@ decoded = Conv1D(
     kernel_regularizer=regularizers.l1(reg_strength)
 )(decoded)
 
+# ======================== LOSS SCALING ======================== #
+# Instructions: Comment/Uncomment the loss scaler you want to test
+
 # loss_scaler = tf.train.experimental.FixedLossScale(32768)
+
 # loss_scaler = tf.train.experimental.DynamicLossScale(
 #     initial_loss_scale=(2 ** 15),
 #     increment_period=2000,
 #     multiplier=2.0
 # )
+
 loss_scaler = "dynamic"
+
+# ============================================================== #
 
 optimizer = tf.keras.optimizers.Adam(lr=LEARNING_RATE)
 optimizer = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt=optimizer, loss_scale=loss_scaler)
 
 print('Optimizer Configuration:')
 
-print('\nOptimizer `get_slot_names()`:', optimizer.get_slot_names())
-print()
+print('\nOptimizer `get_slot_names()`: %s\n' % str(optimizer.get_slot_names()))
 
 autoencoder = Model(inputs, decoded)
 autoencoder.compile(optimizer=optimizer, loss='mae', metrics=['mae'])
