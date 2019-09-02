@@ -1,6 +1,6 @@
-# Keras_amp
+# Keras LossScaleOptimizer Fix - Demo
 
-Steps to run the example
+This repository is set up to showcase the fix proposed in: https://github.com/tensorflow/tensorflow/pull/31578
 
 ## 1 -- clone repository
 
