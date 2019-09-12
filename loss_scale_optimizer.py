@@ -17,15 +17,12 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import sys
-
-from six import add_metaclass
-
 from tensorflow.python.distribute import distribution_strategy_context
 from tensorflow.python.framework import smart_cond
 from tensorflow.python.keras import backend
+from tensorflow.python.keras import optimizers
+from tensorflow.python.keras.mixed_precision.experimental import loss_scale as keras_loss_scale_module
 from tensorflow.python.keras.optimizer_v2 import optimizer_v2
-from tensorflow.python.keras.utils.generic_utils import _GLOBAL_CUSTOM_OBJECTS
 from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.training.experimental import loss_scale as loss_scale_module
@@ -33,351 +30,320 @@ from tensorflow.python.util.tf_export import keras_export
 
 
 class _UnwrapPreventer(object):
-    """Wrapper that DistributionStrategy will not unwrap.
+  """Wrapper that DistributionStrategy will not unwrap.
 
-    Typically, DistributionStrategy will unwrap values when going from a cross-
-    replica context to a replica context via `call_for_each_replica`. This class
-    is a wrapper that DistributionStrategy will not unwrap, so it can be used to
-    prevent it from unwrapping a value.
+  Typically, DistributionStrategy will unwrap values when going from a cross-
+  replica context to a replica context via `call_for_each_replica`. This class
+  is a wrapper that DistributionStrategy will not unwrap, so it can be used to
+  prevent it from unwrapping a value.
 
-    TODO(reedwm): Find/implement a better way of preventing values from being
-    unwrapped by DistributionStrategy
-    """
+  TODO(reedwm): Find/implement a better way of preventing values from being
+  unwrapped by DistributionStrategy
+  """
 
-    def __init__(self, value):
-        self.value = value
-
-
-class OptimizerV2MetaFactory(type):
-
-    def __call__(cls, opt, *args, **kwargs):
-
-        if not isinstance(opt, optimizer_v2.OptimizerV2):
-            raise ValueError('"opt" must be an instance of OptimizerV2, but got: %s'
-                             % opt)
-
-        if hasattr(opt, 'clipnorm'):
-            raise ValueError('LossScaleOptimizer does not support wrapping '
-                             'optimizers with a clipnorm. Optimizer %s has clipnorm '
-                             '%s' % (opt, opt.clipnorm))
-
-        if hasattr(opt, 'clipvalue'):
-            raise ValueError('LossScaleOptimizer does not support wrapping '
-                             'optimizers with a clipvalue. Optimizer %s has '
-                             'clipvalue %s' % (opt, opt.clipvalue))
-
-        return cls.__call__(opt=opt, *args, **kwargs)
+  def __init__(self, value):
+    self.value = value
 
 
-@keras_export('keras.optimizers.LossScaleOptimizer')
-@add_metaclass(OptimizerV2MetaFactory)
-class LossScaleOptimizer(object):
+@keras_export('keras.mixed_precision.experimental.LossScaleOptimizer')
+class LossScaleOptimizer(optimizer_v2.OptimizerV2):
+  """An optimizer that applies loss scaling.
 
-    """
-    Loss scaling is a process that multiplies the loss by a multiplier called the
-    loss scale, and divides each gradient by the same multiplier. The pseudocode
-    for this process is:
+  Loss scaling is a process that multiplies the loss by a multiplier called the
+  loss scale, and divides each gradient by the same multiplier. The pseudocode
+  for this process is:
 
-    ```
+  ```
+  loss = ...
+  loss *= loss_scale
+  grads = gradients(loss, vars)
+  grads /= loss_scale
+  ```
+
+  Mathematically, loss scaling has no effect, but can help avoid numerical
+  underflow in intermediate gradients when float16 tensors are used. By
+  multiplying the loss, each intermediate gradient will have the same multiplier
+  applied.
+
+  The loss scale can either be a fixed constant, chosen by the user, or be
+  dynamically determined. Dynamically determining the loss scale is convenient
+  as a loss scale does not have to be explicitly chosen. However it reduces
+  performance.
+
+  This optimizer wraps another optimizer and applies loss scaling to it via a
+  `LossScale`. Loss scaling is applied whenever gradients are
+  computed, either through `minimize()` or `get_gradients()`. The loss scale is
+  updated via `LossScale.update()` whenever gradients are applied, either
+  through `minimize()` or `apply_gradients()`. For example:
+
+  ```python
+  opt = tf.keras.optimizers.SGD(0.1)
+  opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, "dynamic")
+  # 'minimize' applies loss scaling to the loss and updates the loss sale.
+  opt.minimize(loss_fn)
+  ```
+
+  If a `tf.GradientTape` is used to compute gradients instead of
+  `LossScaleOptimizer.minimize` or `LossScaleOptimizer.get_gradients`, the loss
+  and gradients must be scaled manually. This can be done by calling
+  `LossScaleOptimizer.get_scaled_loss` before passing the loss to
+  `tf.GradientTape`, and `LossScaleOptimizer.get_unscaled_gradients` after
+  computing the gradients with `tf.GradientTape`. For example:
+
+  ```python
+  opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(...)
+  vars = ...
+  with tf.GradientTape() as tape:
     loss = ...
-    loss *= loss_scale
-    grads = gradients(loss, vars)
-    grads /= loss_scale
-    ```
+    scaled_loss = opt.get_scaled_loss(loss)
+  scaled_grads = tape.gradient(scaled_loss, vars)
+  grads = opt.get_unscaled_gradients(scaled_grads)
+  opt.apply_gradients(zip(grads, vars))  # Loss scale will be updated here
+  ```
+  """
 
-    Mathematically, loss scaling has no effect, but can help avoid numerical
-    underflow in intermediate gradients when float16 tensors are used. By
-    multiplying the loss, each intermediate gradient will have the same multiplier
-    applied.
+  def __init__(self, opt, loss_scale):
+    """Initializes this loss scale optimizer.
 
-    The loss scale can either be a fixed constant, chosen by the user, or be
-    dynamically determined. Dynamically determining the loss scale is convenient
-    as a loss scale does not have to be explicitly chosen. However it reduces
-    performance.
-
-    This optimizer wraps another optimizer and applies loss scaling to it via a
-    `LossScale`. Loss scaling is applied whenever gradients are
-    computed, either through `minimize()` or `get_gradients()`. The loss scale is
-    updated via `LossScale.update()` whenever gradients are applied, either
-    through `minimize()` or `apply_gradients()`. For example:
-
-    ```python
-    opt = tf.keras.optimizers.SGD(0.1)
-    opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(opt, "dynamic")
-    # 'minimize' applies loss scaling to the loss and updates the loss sale.
-    opt.minimize(loss_fn)
-    ```
-
-    If a `tf.GradientTape` is used to compute gradients instead of
-    `LossScaleOptimizer.minimize` or `LossScaleOptimizer.get_gradients`, the loss
-    and gradients must be scaled manually. This can be done by calling
-    `LossScaleOptimizer.get_scaled_loss` before passing the loss to
-    `tf.GradientTape`, and `LossScaleOptimizer.get_unscaled_gradients` after
-    computing the gradients with `tf.GradientTape`. For example:
-
-    ```python
-    opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(...)
-    vars = ...
-    with tf.GradientTape() as tape:
-      loss = ...
-      scaled_loss = opt.get_scaled_loss(loss)
-    scaled_grads = tape.gradient(scaled_loss, vars)
-    grads = opt.get_unscaled_gradients(scaled_grads)
-    opt.apply_gradients(zip(grads, vars))  # Loss scale will be updated here
-    ```
+    Args:
+      opt: The Optimizer instance to wrap.
+      loss_scale: The loss scale to scale the loss and gradients. This can
+        either be an int/float to use a fixed loss scale, the string "dynamic"
+        to use dynamic loss scaling, or an instance of a LossScale. The string
+        "dynamic" equivalent to passing `DynamicLossScale()`, and passing an
+        int/float is equivalent to passing a FixedLossScale with the given loss
+        scale.
     """
+    if not isinstance(opt, optimizer_v2.OptimizerV2):
+      raise ValueError('"opt" must be an instance of OptimizerV2, but got: %s'
+                       % opt)
+    if hasattr(opt, 'clipnorm'):
+      raise ValueError('LossScaleOptimizer does not support wrapping '
+                       'optimizers with a clipnorm. Optimizer %s has clipnorm '
+                       '%s' % (opt, opt.clipnorm))
 
-    # TODO(reedwm): Maybe throw an error if mixed precision is used without this
-    # optimizer being used.
+    if hasattr(opt, 'clipvalue'):
+      raise ValueError('LossScaleOptimizer does not support wrapping '
+                       'optimizers with a clipvalue. Optimizer %s has '
+                       'clipvalue %s' % (opt, opt.clipvalue))
 
-    @staticmethod
-    def __call__(opt, loss_scale):
-        """Initializes a loss scaled optimizer.
+    self._optimizer = opt
+    self._loss_scale = keras_loss_scale_module.get(loss_scale)
+    for weight in loss_scale_module.get_loss_scale_weights(self._loss_scale):
+      # We cannot call `track_variable` in the LossScale class itself, because a
+      # file outside of Keras cannot depend on a Keras file. Calling it here
+      # instead is OK, because a variable only needs to be tracked if used with
+      # a Keras class, and the only way to use LossScale with a Keras class is
+      # through the LossScaleOptimizer.
+      backend.track_variable(weight)
+    self._track_trackable(self._optimizer, 'base_optimizer')
+    self._track_trackable(self._loss_scale, 'loss_scale')
 
-        Args:
-          opt: The Optimizer instance to wrap.
-          loss_scale: The loss scale to scale the loss and gradients. This can
-            either be an int/float to use a fixed loss scale, the string "dynamic"
-            to use dynamic loss scaling, or an instance of a LossScale. The string
-            "dynamic" equivalent to passing `DynamicLossScale()`, and passing an
-            int/float is equivalent to passing a FixedLossScale with the given loss
-            scale.
-        Returns:
-          Keras Optimizer with loss scaling
-        """
+    # Needed because the superclass's __getattribute__ checks this.
+    self._hyper = {}
 
-        opt._loss_scale = loss_scale_module.get(loss_scale)
+  @property
+  def loss_scale(self):
+    """The `LossScale` instance associated with this optimizer."""
+    return self._loss_scale
 
-        for weight in loss_scale_module.get_loss_scale_weights(opt._loss_scale):
-            # We cannot call `track_variable` in the LossScale class itself, because a
-            # file outside of Keras cannot depend on a Keras file. Calling it here
-            # instead is OK, because a variable only needs to be tracked if used with
-            # a Keras class, and the only way to use LossScale with a Keras class is
-            # through the LossScaleOptimizer.
-            backend.track_variable(weight)
+  def get_scaled_loss(self, loss):
+    """Scales the loss by the loss scale.
 
-        opt._track_trackable(opt._loss_scale, 'loss_scale')
+    This method is only needed if you compute gradients manually, e.g. with
+    `tf.GradientTape`. In that case, call this method to scale the loss before
+    passing the loss to `tf.GradientTape`. If you use
+    `LossScaleOptimizer.minimize` or `LossScaleOptimizer.get_gradients`, loss
+    scaling is automatically applied and this method is unneeded.
 
-        class BaseOptimizer(object):
-            _class = opt.__class__
-            _classname = "%s.%s" % (opt.__module__, opt.__class__.__name__)
-            _compute_gradients = opt._compute_gradients
-            get_gradients = opt.get_gradients
-            apply_gradients = opt.apply_gradients
-            get_config = opt.get_config
-            from_config = opt.from_config
+    If this method is called, `get_unscaled_gradients` should also be called.
+    See the `tf.keras.mixed_precision.experimental.LossScaleOptimizer` doc for
+    an example.
 
-        opt.loss_scale_base_opt = BaseOptimizer
+    Args:
+      loss: The loss, which will be multiplied by the loss scale. Can either be
+        a tensor or a callable returning a tensor.
 
-        # Generate a fake class with name "LossScaleOptimizer"
-        # Essential to avoid modifying the optimizer original class
+    Returns:
+      `loss` multiplied by `LossScaleOptimizer.loss_scale()`.
+    """
+    loss_scale = self._loss_scale()
+    if callable(loss):
+      def new_loss():
+        loss_val = loss()
+        return loss_val * math_ops.cast(loss_scale, loss_val.dtype)
+      return new_loss
+    else:
+      return loss * math_ops.cast(loss_scale, loss.dtype)
 
-        base_opt_class_dict = dict(opt.__class__.__dict__)
-        base_opt_class_dict.update(dict(LossScaleOptimizer.__dict__))
+  def get_unscaled_gradients(self, grads):
+    """Unscales the gradients by the loss scale.
 
-        del base_opt_class_dict["__call__"]
-        del base_opt_class_dict["__dict__"]
-        del base_opt_class_dict["__weakref__"]
+    This method is only needed if you compute gradients manually, e.g. with
+    `tf.GradientTape`. In that case, call this method to unscale the gradients
+    after computing them with `tf.GradientTape`. If you use
+    `LossScaleOptimizer.minimize` or `LossScaleOptimizer.get_gradients`, loss
+    scaling is automatically applied and this method is unneeded.
 
-        opt.__class__ = type(
-            LossScaleOptimizer.__name__,
-            (opt.loss_scale_base_opt._class,),
-            base_opt_class_dict
-        )
+    If this method is called, `get_scaled_loss` should also be called. See
+    the `tf.keras.mixed_precision.experimental.LossScaleOptimizer` doc for an
+    example.
 
-        return opt
+    Args:
+      grads: A list of tensors, each which will be divided by the loss scale.
+        Can have None values, which are ignored.
 
-    def get_config(self):
+    Returns:
+      A new list the same size as `grads`, where every non-None value in `grads`
+      is divided by `LossScaleOptimizer.loss_scale()`.
+    """
+    loss_scale = self._loss_scale()
+    loss_scale_reciprocal = 1. / loss_scale
+    return [g * math_ops.cast(loss_scale_reciprocal, g.dtype) if g is not None
+            else None for g in grads]
 
-        config = {
-            'loss_scale_classname': self._loss_scale.__class__.__name__,
-            'loss_scale_args': self._loss_scale.get_config(),
-            'opt_base_classname': self.loss_scale_base_opt._classname,
-            'opt_base_config': self.loss_scale_base_opt.get_config()
-        }
+  def _compute_gradients(self, loss, var_list, grad_loss=None):
+    loss = self.get_scaled_loss(loss)
+    grads_and_vars = self._optimizer._compute_gradients(loss, var_list,  # pylint: disable=protected-access
+                                                        grad_loss)
+    grads = [g for g, _ in grads_and_vars]
+    variables = [v for _, v in grads_and_vars]
+    unscaled_grads = self.get_unscaled_gradients(grads)
+    return list(zip(unscaled_grads, variables))
 
-        return config
+  def get_gradients(self, loss, params):
+    loss = self.get_scaled_loss(loss)
+    grads = self._optimizer.get_gradients(loss, params)
+    return self.get_unscaled_gradients(grads)
 
-    @classmethod
-    def from_config(cls, config, custom_objects=None):
+  def apply_gradients(self, grads_and_vars, name=None):
+    if distribution_strategy_context.in_cross_replica_context():
+      raise ValueError('apply_gradients() must be called in a replica context.')
+    grads_and_vars = tuple(grads_and_vars)
+    return distribution_strategy_context.get_replica_context().merge_call(
+        self._apply_gradients_cross_replica, args=(grads_and_vars, name))
 
-        base_opt_classname = config["opt_base_classname"]
+  def _apply_gradients_cross_replica(self, distribution, grads_and_vars, name):
+    grads = [g for g, _ in grads_and_vars]
+    loss_scale_update_op, should_apply_grads = self._loss_scale.update(grads)
 
-        opt_class = getattr(
-            sys.modules[".".join(base_opt_classname.split(".")[:-1])],
-            base_opt_classname.split(".")[-1]
-        )
-        opt = opt_class.from_config(config["opt_base_config"], custom_objects=custom_objects)
+    def apply_fn():
+      # We do not want DistributionStrategy to unwrap any MirroredVariables in
+      # grads_and_vars, because even in a replica context, the wrapped optimizer
+      # expects mirrored variables. So we wrap the variables with an
+      # _UnwrapPreventer, preventing DistributionStrategy from unwrapping the
+      # MirroredVariables.
+      wrapped_vars = _UnwrapPreventer([v for _, v in grads_and_vars])
+      return distribution.extended.call_for_each_replica(
+          self._apply_gradients, args=(grads, wrapped_vars, name))
 
-        for loss_scale_class in loss_scale_module.LossScale.__subclasses__():
-            if config["loss_scale_classname"] == loss_scale_class.__name__:
-                loss_scale = loss_scale_class.from_config(config["loss_scale_args"])
-                break
-        else:
-            raise ValueError("Unsupported Loss Scale class: %s" % config["loss_scale_classname"])
+    # Note: We must call this cond() in a cross-replica context.
+    # DistributionStrategy does not support having a cond in a replica context
+    # with a branch that calls `merge_call`, and self._optimizer.apply_gradients
+    # calls `merge_call`.
+    maybe_apply_op = smart_cond.smart_cond(should_apply_grads,
+                                           apply_fn,
+                                           control_flow_ops.no_op)
+    return control_flow_ops.group(maybe_apply_op, loss_scale_update_op)
 
-        return LossScaleOptimizer(opt=opt, loss_scale=loss_scale)
+  def _apply_gradients(self, grads, wrapped_vars, name):
+    return self._optimizer.apply_gradients(list(zip(grads, wrapped_vars.value)),
+                                           name)
 
-    def _apply_gradients(self, grads, wrapped_vars, name):
+  def get_config(self):
+    serialized_opt = optimizers.serialize(self._optimizer)
+    serialized_loss_scale = keras_loss_scale_module.serialize(self._loss_scale)
+    return {
+        'opt': serialized_opt,
+        'loss_scale': serialized_loss_scale,
+    }
 
-        return self.loss_scale_base_opt.apply_gradients(list(zip(grads, wrapped_vars.value)), name)
+  @classmethod
+  def from_config(cls, config, custom_objects=None):
+    config = config.copy()  # Make a copy, since we mutate config
+    config['opt'] = optimizers.deserialize(
+        config['opt'], custom_objects=custom_objects)
+    config['loss_scale'] = keras_loss_scale_module.deserialize(
+        config['loss_scale'], custom_objects=custom_objects)
+    return cls(**config)
 
-    def _apply_gradients_cross_replica(self, distribution, grads_and_vars, name):
-        grads = [g for g, _ in grads_and_vars]
-        loss_scale_update_op, should_apply_grads = self._loss_scale.update(grads)
+  # Delegations: We delegate most OptimizerV2 methods to the wrapped optimizer
+  # below.
 
-        def apply_fn():
-            # We do not want DistributionStrategy to unwrap any MirroredVariables in
-            # grads_and_vars, because even in a replica context, the wrapped optimizer
-            # expects mirrored variables. So we wrap the variables with an
-            # _UnwrapPreventer, preventing DistributionStrategy from unwrapping the
-            # MirroredVariables.
-            wrapped_vars = _UnwrapPreventer([v for _, v in grads_and_vars])
+  @property
+  def iterations(self):
+    return self._optimizer.iterations
 
-            return distribution.extended.call_for_each_replica(
-                self._apply_gradients, args=(grads, wrapped_vars, name))
+  @iterations.setter
+  def iterations(self, variable):
+    self._optimizer.iterations = variable
 
-        # Note: We must call this cond() in a cross-replica context.
-        # DistributionStrategy does not support having a cond in a replica context
-        # with a branch that calls `merge_call`, and apply_gradients calls `merge_call`.
-        maybe_apply_op = smart_cond.smart_cond(should_apply_grads,
-                                               apply_fn,
-                                               control_flow_ops.no_op)
+  def get_slot_names(self):
+    return self._optimizer.get_slot_names()
 
-        return control_flow_ops.group(maybe_apply_op, loss_scale_update_op)
+  def variables(self):
+    return self._optimizer.variables()
 
-    def _compute_gradients(self, loss, var_list, grad_loss=None):
-        loss = self.get_scaled_loss(loss)
-        grads_and_vars = self.loss_scale_base_opt._compute_gradients(loss, var_list, grad_loss)
+  @property
+  def weights(self):
+    return self._optimizer.weights
 
-        grads = [g for g, _ in grads_and_vars]
-        variables = [v for _, v in grads_and_vars]
-        unscaled_grads = self.get_unscaled_gradients(grads)
-        return list(zip(unscaled_grads, variables))
+  def get_weights(self):
+    return self._optimizer.get_weights()
 
-    def get_gradients(self, loss, params):
-        """
-        Compute gradients of all trainable variables.
-        See Optimizer.get_gradients() for more info.
-        In _LossScaleOptimizer, get_gradients() is overriden to also
-        apply loss scaling before computing the gradients.
-        """
-        loss = self.get_scaled_loss(loss)
-        grads = self.loss_scale_base_opt.get_gradients(loss, params)
-        return self.get_unscaled_gradients(grads)
+  def set_weights(self, weights):
+    return self._optimizer.set_weights(weights)
 
-    def apply_gradients(self, grads_and_vars=None, name=None):
-        """Apply gradients to provided variables.
-        See Optimizer.apply_gradients() for more info.
-        """
-        if distribution_strategy_context.in_cross_replica_context():
-            raise ValueError('apply_gradients() must be called in a replica context.')
+  # For the most part, we only expose methods in the base OptimizerV2, not
+  # individual subclasses like Adam. However, although "learning_rate" and "lr"
+  # properties are not part of the base OptimizerV2 class, they are part of most
+  # subclasses, so we expose them here for convenience.
 
-        grads_and_vars = tuple(grads_and_vars)
+  @property
+  def learning_rate(self):
+    return self._optimizer.learning_rate
 
-        return distribution_strategy_context.get_replica_context().merge_call(
-            self._apply_gradients_cross_replica, args=(grads_and_vars, name)
-        )
+  @learning_rate.setter
+  def learning_rate(self, lr):
+    self._optimizer.learning_rate = lr
 
-    def get_scaled_loss(self, loss):
-        """Scales the loss by the loss scale.
+  @property
+  def lr(self):
+    return self._optimizer.lr
 
-        This method is only needed if you compute gradients manually, e.g. with
-        `tf.GradientTape`. In that case, call this method to scale the loss before
-        passing the loss to `tf.GradientTape`. If you use
-        `LossScaleOptimizer.minimize` or `LossScaleOptimizer.get_gradients`, loss
-        scaling is automatically applied and this method is unneeded.
+  @lr.setter
+  def lr(self, lr):
+    self._optimizer.lr = lr
 
-        If this method is called, `get_unscaled_gradients` should also be called.
-        See the `tf.keras.mixed_precision.experimental.LossScaleOptimizer` doc for
-        an example.
+  def get_slot(self, var, slot_name):
+    # We cannot implement get_slot for the following reason: When saving a
+    # checkpoint, two optimizers cannot share slot variables. Since both the
+    # LossScaleOptimizer and the wrapped optimizer (self and self._optimizer
+    # respectively) are checkpointed, we cannot expose the wrapped optimizer's
+    # slots in the LossScaleOptimizer. Otherwise, a checkpoint would believe
+    # both optimizers share slot variables.
+    raise AttributeError(
+        'You cannot call get_slot on a LossScaleOptimizer. This limitation '
+        'will be removed in the future.')
 
-        Args:
-          loss: The loss, which will be multiplied by the loss scale. Can either be
-            a tensor or a callable returning a tensor.
+  def add_slot(self, var, slot_name, initializer='zeros'):
+    # We disallow adding a slot for consistency with `get_slot`.
+    raise AttributeError(
+        'You cannot call add_slot on a LossScaleOptimizer. This limitation '
+        'will be removed in the future.')
 
-        Returns:
-          `loss` multiplied by `LossScaleOptimizer.loss_scale()`.
-        """
-        loss_scale = self._loss_scale()
+  # We do not override some OptimizerV2 methods. For each, we describe why we do
+  # not delegate them to self._optimizer:
+  # * get_updates: get_updates() calls get_gradients(). Since we override
+  #   get_gradients(), we cannot delegate get_updates() to self._optimizer,
+  #   otherwise the overridden get_gradients() method would not be called.
+  #   Luckily, get_updates() does not access any OptimizerV2 fields, so
+  #   inheriting the OptimizerV2 version works fine.
+  # * minimize: We don't delegate for a similar as get_updates(): it calls
+  #   both self._compute_gradients() and self.apply_gradients(), and both need
+  #   to have the LossScaleOptimizer version called.
 
-        if callable(loss):
-            def new_loss():
-                loss_val = loss()
-                return loss_val * math_ops.cast(loss_scale, loss_val.dtype)
+  # TODO(reedwm): Maybe merge this class's functionality into OptimizerV2.
 
-            return new_loss
-
-        else:
-           return loss * math_ops.cast(loss_scale, loss.dtype)
-
-    def get_unscaled_gradients(self, grads):
-        """Unscales the gradients by the loss scale.
-
-        This method is only needed if you compute gradients manually, e.g. with
-        `tf.GradientTape`. In that case, call this method to unscale the gradients
-        after computing them with `tf.GradientTape`. If you use
-        `LossScaleOptimizer.minimize` or `LossScaleOptimizer.get_gradients`, loss
-        scaling is automatically applied and this method is unneeded.
-
-        If this method is called, `get_scaled_loss` should also be called. See
-        the `tf.keras.mixed_precision.experimental.LossScaleOptimizer` doc for an
-        example.
-
-        Args:
-          grads: A list of tensors, each which will be divided by the loss scale.
-            Can have None values, which are ignored.
-
-        Returns:
-          A new list the same size as `grads`, where every non-None value in `grads`
-          is divided by `LossScaleOptimizer.loss_scale()`.
-        """
-        loss_scale = self._loss_scale()
-        loss_scale_reciprocal = 1. / loss_scale
-        return [g * math_ops.cast(loss_scale_reciprocal, g.dtype) if g is not None else None for g in grads]
-
-    @property
-    def loss_scale(self):
-        """The `LossScale` instance associated with this optimizer."""
-        return self._loss_scale
-
-    @property
-    def loss_scale_increment_period(self):
-        """The `LossScale` instance associated with this optimizer."""
-        try:
-            return self._loss_scale._increment_period
-        except AttributeError:
-            raise ValueError("Loss Scale does not have an attribute `_increment_period`")
-
-    @property
-    def loss_scale_multiplier(self):
-        """The `LossScale` instance associated with this optimizer."""
-        try:
-            return self._loss_scale._multiplier
-        except AttributeError:
-            raise ValueError("Loss Scale does not have an attribute `_multiplier`")
-
-    @property
-    def loss_scale_value(self):
-        """The `LossScale` instance associated with this optimizer."""
-
-        loss_scale_values_attr_names = ["_current_loss_scale", "_loss_scale_value"]
-
-        for attr_name in loss_scale_values_attr_names:
-            if hasattr(self._loss_scale, attr_name):
-                return getattr(self._loss_scale, attr_name)
-        else:
-            raise ValueError(
-                "Loss Scale does not have any attribute with name: `%s`" % str(loss_scale_values_attr_names)
-            )
-
-    @property
-    def num_good_steps(self):
-        """The `LossScale` instance associated with this optimizer."""
-        try:
-            return self._loss_scale._num_good_steps
-        except AttributeError:
-            raise ValueError("Loss Scale does not have an attribute `_num_good_steps`")
-
-
-_GLOBAL_CUSTOM_OBJECTS["LossScaleOptimizer"] = LossScaleOptimizer
+  # TODO(reedwm): Maybe throw an error if mixed precision is used without this
+  # optimizer being used.

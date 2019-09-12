@@ -152,12 +152,12 @@ for epoch in range(4):
     print("[*] Optimizer `learning_rate`: %f" % K.eval(optimizer.learning_rate))
     print("[*] Optimizer `lr`: %f" % K.eval(optimizer.lr))
 
-    print("\n[*] Optimizer `loss_scale_value`: %f" % K.eval(optimizer.loss_scale_value))
+    print("\n[*] Optimizer `loss_scale_value`: %f" % K.eval(optimizer.loss_scale()))
 
     try:
-        print("[*] Optimizer `loss_scale_increment_period`: %f" % K.eval(optimizer.loss_scale_increment_period))
-        print("[*] Optimizer `loss_scale_multiplier`: %f" % K.eval(optimizer.loss_scale_multiplier))
-        print("[*] Optimizer `num_good_steps`: %f" % K.eval(optimizer.num_good_steps))
+        print("[*] Optimizer `loss_scale_increment_period`: %f" % K.eval(optimizer.loss_scale.increment_period))
+        print("[*] Optimizer `loss_scale_multiplier`: %f" % K.eval(optimizer.loss_scale.multiplier))
+        print("[*] Optimizer `num_good_steps`: %f" % K.eval(optimizer.loss_scale._num_good_steps))
     except ValueError:
         if not isinstance(loss_scaler, tf.train.experimental.DynamicLossScale):
             pass
